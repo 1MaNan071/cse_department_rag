@@ -342,17 +342,31 @@ export interface IngestedFileInfo {
 }
 
 export async function listIngestedFiles(): Promise<IngestedFileInfo[]> {
-    // Use a lightweight RPC or distinct query instead of fetching ALL rows.
-    // Group by fileName to get chunk counts without transferring every row's metadata.
-    const { data, error } = await supabaseAdmin
-        .from('documents')
-        .select('metadata')
-        .order('created_at', { ascending: false });
+    // Supabase REST can paginate large result sets; fetch in pages so we can
+    // reliably include every file represented in the documents table.
+    const pageSize = 1000;
+    let from = 0;
+    const allRows: Array<{ metadata: any }> = [];
 
-    if (error) throw new Error(error.message);
+    while (true) {
+        const to = from + pageSize - 1;
+        const { data, error } = await supabaseAdmin
+            .from('documents')
+            .select('metadata')
+            .order('created_at', { ascending: false })
+            .range(from, to);
+
+        if (error) throw new Error(error.message);
+
+        const rows = data || [];
+        allRows.push(...rows);
+
+        if (rows.length < pageSize) break;
+        from += pageSize;
+    }
 
     const seen = new Map<string, IngestedFileInfo & { _count: number }>();
-    for (const row of data || []) {
+    for (const row of allRows) {
         const m = row.metadata;
         if (!m?.fileName) continue;
         const existing = seen.get(m.fileName);
