@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import Groq from 'groq-sdk';
-import { retrieveWithMetadata, ExtractedEntities } from '@/lib/retriever';
+import { retrieveWithMetadata } from '@/lib/retriever';
 import { getSignedUrl, supabaseAdmin } from '@/lib/supabase';
 import { ChatRequest, ChatResponse, Source, DownloadLink } from '@/types';
 
@@ -26,6 +26,62 @@ function detectFileIntent(message: string): 'file_generate' | 'file_download' | 
     if (FILE_GENERATE_PATTERNS.some((p) => p.test(message))) return 'file_generate';
     if (FILE_DOWNLOAD_PATTERNS.some((p) => p.test(message))) return 'file_download';
     return null;
+}
+
+async function searchDownloadLinksByFileNameHint(message: string, limit = 3): Promise<DownloadLink[]> {
+    const stopWords = new Set([
+        'download', 'get', 'retrieve', 'send', 'share', 'give', 'need', 'want', 'find',
+        'file', 'document', 'pdf', 'doc', 'docx', 'the', 'a', 'an', 'my', 'me', 'please',
+        'can', 'you', 'i', 'to', 'for', 'with', 'and', 'from', 'of', 'on', 'in',
+    ]);
+
+    const terms = message
+        .toLowerCase()
+        .replace(/[^a-z0-9.\s_-]/g, ' ')
+        .split(/\s+/)
+        .filter((term) => term.length >= 3 && !stopWords.has(term))
+        .slice(0, 8);
+
+    if (terms.length === 0) return [];
+
+    const orFilter = terms
+        .map((term) => `metadata->>fileName.ilike.%${term}%`)
+        .join(',');
+
+    const { data, error } = await supabaseAdmin
+        .from('documents')
+        .select('metadata')
+        .or(orFilter)
+        .limit(20);
+
+    if (error || !data?.length) return [];
+
+    const candidates: { fileName: string; storagePath?: string; score: number }[] = [];
+    const seen = new Set<string>();
+
+    for (const row of data) {
+        const fileName = row?.metadata?.fileName as string | undefined;
+        const storagePath = row?.metadata?.storagePath as string | undefined;
+        if (!fileName) continue;
+
+        const key = `${fileName}::${storagePath ?? ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const lowerName = fileName.toLowerCase();
+        const score = terms.reduce((acc, term) => (lowerName.includes(term) ? acc + 1 : acc), 0);
+        candidates.push({ fileName, storagePath, score });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+
+    const links: DownloadLink[] = [];
+    for (const candidate of candidates.slice(0, limit)) {
+        const link = await getDownloadLinkForFile(candidate.fileName, candidate.storagePath);
+        if (link) links.push(link);
+    }
+
+    return links;
 }
 
 // ── Date Annotator ────────────────────────────────────────────────────────────
@@ -381,8 +437,9 @@ export async function POST(req: NextRequest) {
         const { chunks, queryType, entities, isAmbiguous, suggestedClarification } =
             await retrieveWithMetadata(message, retrieveCount, retrieveThreshold);
 
-        // Return early for ambiguous queries
-        if (isAmbiguous) {
+        // Return early for ambiguous queries, except download requests where
+        // we can still attempt filename-based link matching.
+        if (isAmbiguous && fileIntent !== 'file_download') {
             return NextResponse.json({
                 answer: `I need a bit more information to help you. ${suggestedClarification}`,
                 sources: [],
@@ -413,15 +470,27 @@ export async function POST(req: NextRequest) {
                 }
             }
 
-            // Fetch download links in parallel — only for top 3 most relevant sources
-            const topSources = sources
-                .filter((s) => s.similarity >= 70)
-                .slice(0, 3);
+            // For explicit download requests, prefer returning links from top files
+            // even when semantic similarity is lower.
+            const topSources = fileIntent === 'file_download'
+                ? sources.slice(0, 3)
+                : sources.filter((s) => s.similarity >= 70).slice(0, 3);
             const linkPromises = topSources
                 .map((source) => getDownloadLinkForFile(source.fileName, source.storagePath));
             const linkResults = await Promise.all(linkPromises);
             for (const link of linkResults) {
                 if (link) downloadLinks.push(link);
+            }
+        }
+
+        // If the query was ambiguous or retrieval was weak, still try to match
+        // file names directly from the user's message for download intent.
+        if (fileIntent === 'file_download' && downloadLinks.length === 0) {
+            const hintedLinks = await searchDownloadLinksByFileNameHint(message, 3);
+            for (const link of hintedLinks) {
+                if (!downloadLinks.some((existing) => existing.url === link.url)) {
+                    downloadLinks.push(link);
+                }
             }
         }
 
@@ -476,6 +545,24 @@ export async function POST(req: NextRequest) {
                     description: `${generateData.sections} sections · Generated from your request`,
                 },
                 intent: 'file_generate',
+            } as ChatResponse);
+        }
+
+        // Return deterministic link-first response for explicit download requests.
+        if (fileIntent === 'file_download') {
+            if (downloadLinks.length > 0) {
+                return NextResponse.json({
+                    answer: `I found ${downloadLinks.length} file${downloadLinks.length > 1 ? 's' : ''} for you. Use the download button${downloadLinks.length > 1 ? 's' : ''} below.`,
+                    sources: sources.slice(0, 3),
+                    downloadLinks,
+                    intent: 'file_download',
+                } as ChatResponse);
+            }
+
+            return NextResponse.json({
+                answer: `I could not confidently match a file to download. Please include part of the file name (for example: "download timetable section a pdf").`,
+                sources: sources.slice(0, 3),
+                intent: 'file_download',
             } as ChatResponse);
         }
 
